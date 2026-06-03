@@ -1,0 +1,16 @@
+{
+  "name": "Comments to Heap Events",
+  "id": "1638694859808314970",
+  "api": "1.0.0",
+  "main": "code.js",
+  "ui": "ui.html",
+  "editorType": [
+    "figma"
+  ],
+  "documentAccess": "dynamic-page",
+  "networkAccess": {
+    "allowedDomains": [
+      "https://api.figma.com"
+    ]
+  }
+}
