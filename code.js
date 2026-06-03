@@ -32,7 +32,9 @@ figma.loadAllPagesAsync().then(function () {
       if (change.type === "PROPERTY_CHANGE" && change.node) {
         var name = "";
         try { name = change.node.name || ""; } catch (e) { continue; }
-        if (name === "Heap anchor" || name.indexOf("[HEAP] ") === 0) {
+        var isAnnotation = false;
+        try { isAnnotation = change.node.getPluginData("heapAnnotation") === "1"; } catch (e) {}
+        if (name === "Heap anchor" || isAnnotation) {
           heapMoved = true;
           break;
         }
@@ -54,7 +56,7 @@ async function liveRefreshConnectors() {
   var page = figma.currentPage;
   var dots = page.findAll(function (n) { return n.name === "Heap anchor"; });
   var connectors = page.findAll(function (n) { return n.name === "Heap connector"; });
-  var annotations = page.findAll(function (n) { return n.name.indexOf("[HEAP] ") === 0 && n.type === "FRAME"; });
+  var annotations = page.findAll(function (n) { return n.getPluginData("heapAnnotation") === "1" && n.type === "FRAME"; });
 
   if (dots.length === 0 || annotations.length === 0) {
     isRefreshing = false;
@@ -274,7 +276,7 @@ async function convertComments(comments, options) {
       // Create annotation card and wrap it in a group
       var annotationFrame = createAnnotationFrame(c.eventName, c.user || "", frameX, frameY);
       var group = figma.group([annotationFrame], figma.currentPage);
-      group.name = "[HEAP] " + c.eventName;
+      group.name = c.eventName;
 
       var pairId = "heap-pair-" + Date.now() + "-" + i;
       annotationFrame.setPluginData("pairId", pairId);
@@ -323,7 +325,7 @@ function createAnnotationFrame(eventName, user, x, y) {
   var date = formatDateSpanish();
 
   var outer = figma.createFrame();
-  outer.name = "[HEAP] " + eventName;
+  outer.name = eventName;
   outer.layoutMode = "HORIZONTAL";
   outer.primaryAxisSizingMode = "AUTO";
   outer.counterAxisSizingMode = "AUTO";
@@ -392,6 +394,7 @@ function createAnnotationFrame(eventName, user, x, y) {
   inner.appendChild(nameText);
   inner.appendChild(dateText);
   outer.appendChild(inner);
+  outer.setPluginData("heapAnnotation", "1");
 
   return outer;
 }
@@ -480,7 +483,7 @@ async function refreshConnectors() {
 
   var dots = page.findAll(function (n) { return n.name === "Heap anchor"; });
   var connectors = page.findAll(function (n) { return n.name === "Heap connector"; });
-  var annotations = page.findAll(function (n) { return n.name.indexOf("[HEAP] ") === 0 && n.type === "FRAME"; });
+  var annotations = page.findAll(function (n) { return n.getPluginData("heapAnnotation") === "1" && n.type === "FRAME"; });
 
   if (dots.length === 0 || annotations.length === 0) {
     figma.notify("No Heap annotations found on this page.");

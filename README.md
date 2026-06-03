@@ -1,6 +1,6 @@
 # Heap Event Tracker — Figma Plugin
 
-Plugin para convertir comentarios `[HEAP]` en anotaciones visuales persistentes en el canvas de Figma.
+Plugin para convertir comentarios de Figma en anotaciones visuales persistentes en el canvas.
 
 ## El problema que resuelve
 
@@ -9,7 +9,7 @@ Los comentarios de Figma no sobreviven a los merges de branches. Este plugin per
 ## Flujo de trabajo
 
 ```
-1. Analista (Collab) → Comenta: [HEAP] AppBE-Token-Configuracion-CambiarPIN
+1. Analista (Collab) → Comenta: AppBE-Token-Configuracion-CambiarPIN
 2. Diseñador (Full Seat) → Ejecuta el plugin antes del merge
 3. Plugin → Convierte comentarios en tarjetas visuales con conectores
 4. Merge → Las tarjetas viajan como frames nativos ✓
@@ -17,12 +17,12 @@ Los comentarios de Figma no sobreviven a los merges de branches. Este plugin per
 
 ## Formato de comentarios
 
-El analista escribe un comentario de Figma que empiece con `[HEAP]` seguido del nombre del evento:
+El analista escribe un comentario de Figma con el nombre del evento:
 
 ```
-[HEAP] AppBE-Token-Configuracion-CambiarPIN
-[HEAP] AppFE-Home-VerPromociones
-[HEAP] WebBE-Checkout-ConfirmarPago
+AppBE-Token-Configuracion-CambiarPIN
+AppFE-Home-VerPromociones
+WebBE-Checkout-ConfirmarPago
 ```
 
 El comentario debe colocarse sobre o cerca del elemento que dispara el evento.
@@ -53,13 +53,13 @@ Coloca estos 3 archivos en una carpeta local:
 ## Uso
 
 ### Primera vez
-1. Abre el archivo de Figma que tiene los comentarios `[HEAP]`
+1. Abre el archivo de Figma que tiene los comentarios
 2. Ejecuta el plugin: **Plugins → Development → Heap Event Tracker**
 3. Pega tu Personal Access Token y haz clic en **Save**
 
 ### Cada vez
 1. Ejecuta el plugin
-2. Haz clic en **Scan [HEAP] comments**
+2. Haz clic en **Escanear comentarios**
 3. Filtra por usuario si lo necesitas
 4. Selecciona/deselecciona los comentarios que quieras convertir
 5. Configura las opciones:
