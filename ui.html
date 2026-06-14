@@ -144,6 +144,13 @@
     padding: 4px 6px; border-radius: 4px;
     word-break: break-all; line-height: 1.4;
   }
+  .comment-item.converted { opacity: 0.55; }
+  .cb-wrap.disabled { cursor: default; border-style: dashed; opacity: 0.5; }
+  .badge-conv {
+    font-size: 9px; font-weight: 600; color: #0f62fe;
+    background: #e8f0fe; padding: 1px 6px; border-radius: 99px;
+    white-space: nowrap;
+  }
 
   /* ─── Options ─── */
   .options { margin-bottom: 12px; }
@@ -172,12 +179,46 @@
     color: var(--figma-color-text-secondary, #999);
   }
   .empty-state p { margin-top: 6px; font-size: 11px; line-height: 1.4; }
-  .spinner {
-    width: 20px; height: 20px; border: 2px solid var(--figma-color-border, #ddd);
-    border-top-color: #d2006e; border-radius: 50%;
-    animation: spin 0.6s linear infinite; margin: 0 auto 8px;
+  /* ─── Branded loader (Heap bars) ─── */
+  .loader-wrap {
+    display: flex; flex-direction: column; align-items: center;
+    padding: 44px 16px; gap: 6px;
+    animation: loaderFade 0.3s ease;
   }
-  @keyframes spin { to { transform: rotate(360deg); } }
+  @keyframes loaderFade { from { opacity: 0; } to { opacity: 1; } }
+  .loader-bars {
+    display: flex; align-items: flex-end; gap: 5px; height: 38px;
+    margin-bottom: 12px;
+  }
+  .loader-bars span {
+    width: 6px; height: 12px; border-radius: 3px;
+    animation: loaderBar 1.1s ease-in-out infinite;
+  }
+  .loader-bars span:nth-child(1) { background: #160f41; animation-delay: 0s; }
+  .loader-bars span:nth-child(2) { background: #31d891; animation-delay: 0.14s; }
+  .loader-bars span:nth-child(3) { background: #160f41; animation-delay: 0.28s; }
+  .loader-bars span:nth-child(4) { background: #31d891; animation-delay: 0.42s; }
+  .loader-bars span:nth-child(5) { background: #160f41; animation-delay: 0.56s; }
+  @keyframes loaderBar {
+    0%, 100% { height: 10px; opacity: 0.45; }
+    50%      { height: 38px; opacity: 1; }
+  }
+  .loader-text {
+    font-size: 13px; font-weight: 600;
+    color: var(--figma-color-text, #160f41);
+  }
+  .loader-sub {
+    font-size: 11px; color: var(--figma-color-text-secondary, #888);
+  }
+  .loader-dots::after {
+    content: ""; animation: loaderDots 1.4s steps(4, end) infinite;
+  }
+  @keyframes loaderDots {
+    0%   { content: ""; }
+    25%  { content: "."; }
+    50%  { content: ".."; }
+    75%  { content: "..."; }
+  }
   .error-msg {
     padding: 8px 10px; background: #FCEBEB; color: #791F1F;
     border-radius: 4px; font-size: 11px; margin-bottom: 10px;
@@ -214,14 +255,16 @@
 </div>
 
 <!-- ═══ Scan Scope ═══ -->
-<div style="display:flex; align-items:center; justify-content:space-between; margin-bottom:8px; padding:8px 10px; background:var(--figma-color-bg-secondary, #f5f5f5); border-radius:6px;">
-  <span style="font-size:11px; color:var(--figma-color-text-secondary, #666);">Solo visible en el viewport actual</span>
-  <div class="toggle" id="optViewport" onclick="this.classList.toggle('on'); updateScanLabel()"></div>
+<div style="margin-bottom:8px; padding:8px 10px; background:var(--figma-color-bg-secondary, #f5f5f5); border-radius:6px;">
+  <div style="display:flex; align-items:center; justify-content:space-between;">
+    <span style="font-size:11px; color:var(--figma-color-text-secondary, #666);">Solo formato de evento (Modulo-Seccion-Accion)</span>
+    <div class="toggle on" id="optFormat" onclick="this.classList.toggle('on')"></div>
+  </div>
 </div>
 
 <!-- ═══ Scan Button ═══ -->
 <button class="btn btn-primary btn-scan" id="scanBtn" onclick="scanComments()">
-  Escanear comentarios
+  Escanear comentarios en vista actual
 </button>
 
 <!-- ═══ Refresh Connectors Button ═══ -->
@@ -255,7 +298,7 @@
   <!-- Options -->
   <div class="options">
     <div class="option-row">
-      Resolver comentarios al convertir
+      Eliminar comentarios originales al convertir
       <div class="toggle" id="optResolve" onclick="this.classList.toggle('on')"></div>
     </div>
   </div>
@@ -269,8 +312,8 @@
 <!-- ═══ Empty State ═══ -->
 <div id="emptyState" style="display:none">
   <div class="empty-state">
-    <p><strong id="emptyTitle">Sin comentarios en esta página</strong></p>
-    <p id="emptyDesc">No hay comentarios sin resolver en la página actual.</p>
+    <p><strong id="emptyTitle">No hay comentarios en la vista actual</strong></p>
+    <p id="emptyDesc">Encuadra en pantalla la zona con comentarios y vuelve a escanear.</p>
   </div>
 </div>
 
@@ -289,15 +332,19 @@
 
 <!-- ═══ Loading State ═══ -->
 <div id="loadingState" style="display:none">
-  <div class="empty-state">
-    <div class="spinner"></div>
-    <p>Escaneando comentarios...</p>
+  <div class="loader-wrap">
+    <div class="loader-bars">
+      <span></span><span></span><span></span><span></span><span></span>
+    </div>
+    <p class="loader-text loader-dots">Escaneando comentarios</p>
+    <p class="loader-sub">Revisando tu vista actual</p>
   </div>
 </div>
 
 <!-- ═══ Success State ═══ -->
 <div id="successState" style="display:none">
   <div class="success-msg" id="successMsg"></div>
+  <div class="error-msg" id="deleteWarning" style="display:none"></div>
   <button class="btn btn-secondary" style="width:100%;margin-top:8px" onclick="resetUI()">
     Escanear de nuevo
   </button>
@@ -309,10 +356,10 @@ var state = {
   fileKey: "",
   token: "",
   comments: [],
+  userNames: [],
   activeUser: "all",
   deleting: false,
   viewportBounds: null,
-  pendingViewport: false,
 };
 
 // ─── Plugin communication ────────────────────────────────────────────
@@ -343,12 +390,8 @@ window.onmessage = function (event) {
       return;
     }
 
-    if (state.pendingViewport) {
-      postToPlugin({ type: "get-viewport" });
-    } else {
-      state.viewportBounds = null;
-      doScan();
-    }
+    // Scanning is always scoped to the current viewport
+    postToPlugin({ type: "get-viewport" });
   }
 
   if (msg.type === "page-nodes-result") {
@@ -356,15 +399,20 @@ window.onmessage = function (event) {
     for (var vi = 0; vi < msg.validIds.length; vi++) validSet[msg.validIds[vi]] = true;
     state.comments = state.comments.filter(function(c) { return validSet[c.id]; });
 
+    // Mark comments that already have an annotation on this page
+    var convertedSet = {};
+    var convIds = msg.convertedIds || [];
+    for (var ci = 0; ci < convIds.length; ci++) convertedSet[convIds[ci]] = true;
+    for (var cj = 0; cj < state.comments.length; cj++) {
+      state.comments[cj].converted = !!convertedSet[state.comments[cj].id];
+    }
+
     document.getElementById("loadingState").style.display = "none";
     document.getElementById("scanBtn").disabled = false;
 
     if (state.comments.length === 0) {
-      document.getElementById("emptyTitle").textContent = state.viewportBounds
-        ? "Sin comentarios en esta vista" : "Sin comentarios en esta página";
-      document.getElementById("emptyDesc").textContent = state.viewportBounds
-        ? "Desplázate a otra área o desactiva el filtro de viewport."
-        : "No hay comentarios sin resolver en la página actual.";
+      document.getElementById("emptyTitle").textContent = "No hay comentarios en la vista actual";
+      document.getElementById("emptyDesc").textContent = "Encuadra en pantalla la zona con comentarios y vuelve a escanear.";
       document.getElementById("emptyState").style.display = "block";
     } else {
       renderResults();
@@ -374,9 +422,10 @@ window.onmessage = function (event) {
 
   if (msg.type === "convert-done") {
     showSuccess(msg.count);
-    // Delete comments if option is on
-    if (document.getElementById("optResolve").classList.contains("on") && msg.count > 0) {
-      deleteConvertedComments();
+    // Delete only the comments whose annotation was actually created
+    var okIds = msg.successIds || [];
+    if (document.getElementById("optResolve").classList.contains("on") && okIds.length > 0) {
+      deleteConvertedComments(okIds);
     }
   }
 
@@ -402,14 +451,6 @@ function refreshConnectors() {
   postToPlugin({ type: "refresh-connectors" });
 }
 
-// ─── Scan label ──────────────────────────────────────────────────────
-function updateScanLabel() {
-  var vp = document.getElementById("optViewport").classList.contains("on");
-  document.getElementById("scanBtn").textContent = vp
-    ? "Escanear comentarios en vista actual"
-    : "Escanear comentarios";
-}
-
 // ─── File key (inline setup when auto-detect fails) ──────────────────
 function saveFileKeyAndScan() {
   var raw = document.getElementById("inlineFileKeyInput").value.trim();
@@ -420,12 +461,7 @@ function saveFileKeyAndScan() {
   postToPlugin({ type: "save-filekey", fileKey: key });
   document.getElementById("fileKeySetupState").style.display = "none";
   document.getElementById("loadingState").style.display = "block";
-  if (state.pendingViewport) {
-    postToPlugin({ type: "get-viewport" });
-  } else {
-    state.viewportBounds = null;
-    doScan();
-  }
+  postToPlugin({ type: "get-viewport" });
 }
 
 function showTokenSetup() {
@@ -465,6 +501,10 @@ function updateTokenStatus() {
 
 // ─── Scan comments from Figma REST API ───────────────────────────────
 function scanComments() {
+  startScan();
+}
+
+function startScan() {
   if (!state.token) {
     showError("Primero configura tu token API de Figma.");
     return;
@@ -478,10 +518,9 @@ function scanComments() {
   document.getElementById("loadingState").style.display = "block";
   document.getElementById("scanBtn").disabled = true;
 
-  // Always try to get a fresh fileKey before scanning
+  // Always try to get a fresh fileKey before scanning;
+  // filekey-result requests the viewport, and viewport-bounds runs doScan()
   postToPlugin({ type: "get-filekey" });
-  // doScan() will be triggered when we receive the filekey-result
-  state.pendingViewport = document.getElementById("optViewport").classList.contains("on");
 }
 
 async function doScan() {
@@ -506,20 +545,23 @@ async function doScan() {
     var data = await response.json();
     var allComments = data.comments || [];
 
-    // All unresolved comments
+    // All unresolved top-level comments (replies in a thread are skipped)
+    var formatOnly = document.getElementById("optFormat").classList.contains("on");
+    var EVENT_PATTERN = /^[^\s]+-[^\s]+$/;
     state.comments = [];
     for (var i = 0; i < allComments.length; i++) {
       var c = allComments[i];
       var msg = (c.message || "").trim();
-      if (!msg || c.resolved_at) continue;
+      if (!msg || c.resolved_at || c.parent_id) continue;
+      if (formatOnly && !EVENT_PATTERN.test(msg)) continue;
       state.comments.push({
         id: c.id,
         eventName: msg,
         user: c.user ? c.user.handle : "Desconocido",
-        userImg: c.user ? c.user.img_url : "",
         clientMeta: c.client_meta || {},
         createdAt: c.created_at,
         checked: false,
+        converted: false,
       });
     }
 
@@ -532,7 +574,8 @@ async function doScan() {
       return;
     }
 
-    // Send to sandbox: page filter + viewport filter (both handled there)
+    // Send to sandbox: page filter always; viewport filter only when not
+    // forcing a full-page scan (null bounds = no viewport filtering)
     var items = state.comments.map(function(c) {
       return {
         commentId: c.id,
@@ -573,13 +616,13 @@ function renderUserFilters() {
     users[u] = (users[u] || 0) + 1;
   }
 
-  var html = '<button class="chip active" onclick="filterByUser(this, \'all\')">Todos <span class="count">' + state.comments.length + "</span></button>";
+  var html = '<button class="chip active" onclick="filterByUser(this, -1)">Todos <span class="count">' + state.comments.length + "</span></button>";
 
-  var userNames = Object.keys(users).sort();
-  for (var j = 0; j < userNames.length; j++) {
-    var name = userNames[j];
+  state.userNames = Object.keys(users).sort();
+  for (var j = 0; j < state.userNames.length; j++) {
+    var name = state.userNames[j];
     var initials = getInitials(name);
-    html += '<button class="chip" onclick="filterByUser(this, \'' + escapeAttr(name) + '\')">';
+    html += '<button class="chip" onclick="filterByUser(this, ' + j + ')">';
     html += '<span class="avatar">' + escapeHtml(initials) + "</span>";
     html += escapeHtml(name) + ' <span class="count">' + users[name] + "</span></button>";
   }
@@ -592,10 +635,16 @@ function renderCommentList() {
   for (var i = 0; i < state.comments.length; i++) {
     var c = state.comments[i];
     var hiddenClass = state.activeUser !== "all" && c.user !== state.activeUser ? " hidden" : "";
+    var convertedClass = c.converted ? " converted" : "";
     var checkedClass = c.checked ? " checked" : "";
+    var uidx = state.userNames.indexOf(c.user);
 
-    html += '<div class="comment-item' + hiddenClass + '" data-idx="' + i + '" data-user="' + escapeAttr(c.user) + '">';
-    html += '<div class="cb-wrap' + checkedClass + '" onclick="toggleCheck(' + i + ')"></div>';
+    html += '<div class="comment-item' + hiddenClass + convertedClass + '" data-idx="' + i + '" data-uidx="' + uidx + '">';
+    if (c.converted) {
+      html += '<div class="cb-wrap disabled"></div>';
+    } else {
+      html += '<div class="cb-wrap' + checkedClass + '" onclick="toggleCheck(' + i + ')"></div>';
+    }
     html += '<div class="comment-body">';
     html += '<div class="comment-meta">';
     html += '<span class="comment-user">' + escapeHtml(c.user) + "</span>";
@@ -603,6 +652,10 @@ function renderCommentList() {
     // Show relative page info from clientMeta if available
     if (c.clientMeta.node_id) {
       html += '<span class="comment-page">en nodo ' + escapeHtml(c.clientMeta.node_id) + "</span>";
+    }
+
+    if (c.converted) {
+      html += '<span class="badge-conv">✓ ya convertida</span>';
     }
 
     html += "</div>";
@@ -614,8 +667,8 @@ function renderCommentList() {
 }
 
 // ─── Filter logic ────────────────────────────────────────────────────
-function filterByUser(el, user) {
-  state.activeUser = user;
+function filterByUser(el, userIdx) {
+  state.activeUser = userIdx === -1 ? "all" : state.userNames[userIdx];
 
   // Update chip states
   var chips = document.getElementById("userFilters").querySelectorAll(".chip");
@@ -625,8 +678,8 @@ function filterByUser(el, user) {
   // Show/hide items
   var items = document.querySelectorAll(".comment-item");
   for (var j = 0; j < items.length; j++) {
-    var itemUser = items[j].getAttribute("data-user");
-    if (user === "all" || itemUser === user) {
+    var itemIdx = parseInt(items[j].getAttribute("data-uidx"));
+    if (userIdx === -1 || itemIdx === userIdx) {
       items[j].classList.remove("hidden");
     } else {
       items[j].classList.add("hidden");
@@ -638,6 +691,7 @@ function filterByUser(el, user) {
 
 // ─── Selection logic ─────────────────────────────────────────────────
 function toggleCheck(idx) {
+  if (state.comments[idx].converted) return;
   state.comments[idx].checked = !state.comments[idx].checked;
   var items = document.querySelectorAll('.comment-item[data-idx="' + idx + '"] .cb-wrap');
   for (var i = 0; i < items.length; i++) {
@@ -647,7 +701,7 @@ function toggleCheck(idx) {
 }
 
 function toggleSelectAll() {
-  var visibleItems = document.querySelectorAll(".comment-item:not(.hidden)");
+  var visibleItems = document.querySelectorAll(".comment-item:not(.hidden):not(.converted)");
   var allChecked = true;
   for (var i = 0; i < visibleItems.length; i++) {
     var idx = parseInt(visibleItems[i].getAttribute("data-idx"));
@@ -680,16 +734,18 @@ function updateSelectionCount() {
 
 // ─── Convert action ──────────────────────────────────────────────────
 function convert() {
+  // Only visible (per active filter), checked and not-yet-converted comments
   var selected = [];
   for (var i = 0; i < state.comments.length; i++) {
-    if (state.comments[i].checked) {
-      selected.push({
-        id: state.comments[i].id,
-        eventName: state.comments[i].eventName,
-        user: state.comments[i].user,
-        clientMeta: state.comments[i].clientMeta,
-      });
-    }
+    var c = state.comments[i];
+    if (!c.checked || c.converted) continue;
+    if (state.activeUser !== "all" && c.user !== state.activeUser) continue;
+    selected.push({
+      id: c.id,
+      eventName: c.eventName,
+      user: c.user,
+      clientMeta: c.clientMeta,
+    });
   }
 
   if (selected.length === 0) return;
@@ -697,50 +753,51 @@ function convert() {
   document.getElementById("convertBtn").disabled = true;
   document.getElementById("convertBtn").textContent = "Convirtiendo...";
 
-  postToPlugin({
-    type: "convert",
-    comments: selected,
-    options: {
-      resolveComments: document.getElementById("optResolve").classList.contains("on"),
-      drawConnectors: true,
-      lockFrames: false,
-    },
-  });
+  postToPlugin({ type: "convert", comments: selected });
 }
 
-// ─── Delete comments via REST API (resolve) ──────────────────────────
-async function deleteConvertedComments() {
+// ─── Delete comments via REST API ────────────────────────────────────
+// Note: Figma only lets the comment author (or an admin) delete a comment,
+// so failures are expected when converting someone else's comments.
+async function deleteConvertedComments(ids) {
   if (state.deleting) return;
   state.deleting = true;
 
-  var selected = [];
-  for (var i = 0; i < state.comments.length; i++) {
-    if (state.comments[i].checked) selected.push(state.comments[i]);
-  }
-
-  for (var j = 0; j < selected.length; j++) {
+  var failed = 0;
+  for (var j = 0; j < ids.length; j++) {
     try {
-      await fetch(
-        "https://api.figma.com/v1/files/" + state.fileKey + "/comments/" + selected[j].id,
+      var res = await fetch(
+        "https://api.figma.com/v1/files/" + state.fileKey + "/comments/" + ids[j],
         { method: "DELETE", headers: { "X-Figma-Token": state.token } }
       );
+      if (!res.ok) failed++;
     } catch (e) {
-      console.error("Failed to delete comment:", selected[j].id, e);
+      console.error("Failed to delete comment:", ids[j], e);
+      failed++;
     }
   }
 
   state.deleting = false;
+
+  if (failed > 0) {
+    var warn = document.getElementById("deleteWarning");
+    warn.textContent = "No se pudieron eliminar " + failed + " comentario(s). " +
+      "Figma solo permite eliminar comentarios propios — pídele al autor que los resuelva.";
+    warn.style.display = "block";
+  }
 }
 
 // ─── UI helpers ──────────────────────────────────────────────────────
 function showSuccess(count) {
   document.getElementById("results").style.display = "none";
+  document.getElementById("deleteWarning").style.display = "none";
   document.getElementById("successState").style.display = "block";
   document.getElementById("successMsg").textContent = "✓ " + count + " anotaciones creadas";
 }
 
 function resetUI() {
   document.getElementById("successState").style.display = "none";
+  document.getElementById("deleteWarning").style.display = "none";
   document.getElementById("results").style.display = "none";
   document.getElementById("emptyState").style.display = "none";
   document.getElementById("fileKeySetupState").style.display = "none";
@@ -768,12 +825,16 @@ function escapeHtml(str) {
   return str.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
 }
 
-function escapeAttr(str) {
-  return str.replace(/'/g, "\\'").replace(/"/g, "&quot;");
-}
+// Enter submits in both setup inputs
+document.getElementById("tokenInput").addEventListener("keydown", function (e) {
+  if (e.key === "Enter") saveToken();
+});
+document.getElementById("inlineFileKeyInput").addEventListener("keydown", function (e) {
+  if (e.key === "Enter") saveFileKeyAndScan();
+});
 </script>
 <div style="text-align:center; padding:8px 0 4px; font-size:10px; color:var(--figma-color-text-tertiary, #bbb);">
-  v0.5<button class="btn-text" style="font-size:10px;color:var(--figma-color-text-tertiary,#bbb)" onclick="showTokenSetup()"></button>
+  v0.67 · <button class="btn-text" style="font-size:10px;color:var(--figma-color-text-tertiary,#bbb)" onclick="showTokenSetup()">Cambiar token</button>
 </div>
 </body>
 </html>

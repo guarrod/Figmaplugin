@@ -1,15 +1,32 @@
 // Heap Event Tracker - Plugin Code (sandbox)
-// Converts [HEAP] comments into visual annotation frames on the canvas
-// Uses native Figma connectors that auto-adjust when nodes are moved
+// Converts comments into visual annotation frames on the canvas
+// Card, anchor dot and connector stay as loose siblings (linked by pairId)
+// so the card can be repositioned freely without dragging the anchor along.
+//
+// Scanning: the scan filter (check-page-nodes) builds a complete node map of
+// the current page via figma.currentPage.findAll() and resolves each comment's
+// pin position from its anchor node's absoluteBoundingBox + node_offset, then
+// keeps only comments whose pin falls inside the current viewport bounds.
+// This is the original, proven approach — reliable across nested nodes.
+// Heap annotation nodes themselves are created at the top level of the page,
+// so the live-refresh index (collectPairNodes) only walks page.children.
 
 figma.showUI(__html__, { width: 380, height: 580, themeColors: true });
+
+// Skip invisible instance children during traversal. Comment anchors and Heap
+// nodes never live inside hidden instance subtrees, so this is a safe and
+// significant speedup for scanning large, component-heavy files.
+figma.skipInvisibleInstanceChildren = true;
 
 // ─── Init ────────────────────────────────────────────────────────────
 (async () => {
   const token = (await figma.clientStorage.getAsync("heap-token")) || "";
-  // File key: try auto-detect, then check if saved on the file itself
-  const rootFileKey = figma.root.getPluginData("fileKey") || "";
-  const fileKey = figma.fileKey || rootFileKey || "";
+  // Always use the file currently open on screen. Only fall back to a saved
+  // key if the editor can't report the current one (manual entry as a last
+  // resort) — so the plugin scans wherever the user is, never a stale file.
+  var fileKey = "";
+  try { fileKey = figma.fileKey || ""; } catch (e) {}
+  if (!fileKey) { try { fileKey = figma.root.getPluginData("fileKey") || ""; } catch (e) {} }
   figma.ui.postMessage({
     type: "init",
     fileKey: fileKey,
@@ -17,78 +34,220 @@ figma.showUI(__html__, { width: 380, height: 580, themeColors: true });
   });
 })();
 
+// ─── Heap node discovery (top-level scan — cheap even on huge pages) ─
+function collectPairNodes(page) {
+  var res = {
+    dotsByPair: {}, dotsById: {}, annByPair: {}, connsByPair: {},
+    dots: [], legacyConnectors: [], pairIdByNodeId: {},
+  };
+  var children = page.children;
+  for (var i = 0; i < children.length; i++) {
+    visitHeapCandidate(children[i], res, 0);
+  }
+  return res;
+}
+
+function visitHeapCandidate(n, res, depth) {
+  var pid = "";
+  try { pid = n.getPluginData("pairId") || ""; } catch (e) { return; }
+
+  if (n.name === "Heap connector") {
+    if (pid) {
+      if (!res.connsByPair[pid]) res.connsByPair[pid] = [];
+      res.connsByPair[pid].push(n);
+    } else {
+      res.legacyConnectors.push(n); // created before v0.6, no pairId
+    }
+  } else if (pid && n.name === "Heap anchor") {
+    res.dotsByPair[pid] = n;
+    res.dotsById[n.id] = n;
+    res.dots.push(n);
+  } else if (pid && n.type === "FRAME" && n.getPluginData("heapAnnotation") === "1") {
+    res.annByPair[pid] = n;
+  }
+
+  if (pid) res.pairIdByNodeId[n.id] = pid;
+
+  // Cards live one level inside their group; tolerate sections too.
+  // Never recurse into FRAMEs — that's where the actual design lives.
+  if (depth < 3 && (n.type === "GROUP" || n.type === "SECTION")) {
+    var kids = n.children;
+    for (var k = 0; k < kids.length; k++) visitHeapCandidate(kids[k], res, depth + 1);
+  }
+}
+
 // ─── Live connector refresh on node move ─────────────────────────────
 var isRefreshing = false;
 var refreshTimeout = null;
+var pendingPairIds = {};   // pairId -> true (pairs whose nodes moved)
+var pendingDotIds = {};    // dotId -> true (dots dragged by the user)
+var pendingTargetIds = {}; // anchored element id -> true (elements that moved)
+var attachedPages = {};
 
-// Must load all pages before registering documentchange in incremental mode
-figma.loadAllPagesAsync().then(function () {
-  figma.on("documentchange", function (event) {
-    if (isRefreshing) return;
+// Index so the nodechange handler does pure id lookups (no API calls)
+var heapIndex = null; // { pairIdByNodeId, targetToDots }
 
-    var heapMoved = false;
-    for (var i = 0; i < event.documentChanges.length; i++) {
-      var change = event.documentChanges[i];
-      if (change.type === "PROPERTY_CHANGE" && change.node) {
-        var name = "";
-        try { name = change.node.name || ""; } catch (e) { continue; }
-        var isAnnotation = false;
-        try { isAnnotation = change.node.getPluginData("heapAnnotation") === "1"; } catch (e) {}
-        if (name === "Heap anchor" || isAnnotation) {
-          heapMoved = true;
-          break;
-        }
+function rebuildHeapIndex() {
+  try {
+    var pairs = collectPairNodes(figma.currentPage);
+    var targetToDots = {};
+    for (var i = 0; i < pairs.dots.length; i++) {
+      var nid = "";
+      try { nid = pairs.dots[i].getPluginData("anchorNodeId"); } catch (e) {}
+      if (!nid) continue;
+      if (!targetToDots[nid]) targetToDots[nid] = {};
+      targetToDots[nid][pairs.dots[i].id] = true;
+    }
+    heapIndex = { pairIdByNodeId: pairs.pairIdByNodeId, targetToDots: targetToDots };
+  } catch (e) {
+    heapIndex = { pairIdByNodeId: {}, targetToDots: {} };
+  }
+}
+
+function geoChanged(props) {
+  if (!props) return false;
+  // Figma reports a drag as x/y on leaf nodes, but as "relativeTransform" when
+  // moving a GROUP (the card) — without this the card move was never detected.
+  return props.indexOf("x") !== -1 || props.indexOf("y") !== -1 ||
+         props.indexOf("width") !== -1 || props.indexOf("height") !== -1 ||
+         props.indexOf("relativeTransform") !== -1;
+}
+
+function handleNodeChanges(nodeChanges) {
+  if (isRefreshing || !heapIndex) return;
+
+  var relevant = false;
+  for (var i = 0; i < nodeChanges.length; i++) {
+    var change = nodeChanges[i];
+    if (change.type !== "PROPERTY_CHANGE" || !change.node) continue;
+    if (!geoChanged(change.properties)) continue;
+    var node = change.node;
+
+    var pid = heapIndex.pairIdByNodeId[node.id];
+    if (pid) {
+      pendingPairIds[pid] = true;
+      try {
+        if (!node.removed && node.name === "Heap anchor") pendingDotIds[node.id] = true;
+      } catch (e) {}
+      relevant = true;
+    } else if (heapIndex.targetToDots[node.id]) {
+      pendingTargetIds[node.id] = true;
+      relevant = true;
+    }
+  }
+
+  if (!relevant) return;
+
+  if (refreshTimeout) clearTimeout(refreshTimeout);
+  refreshTimeout = setTimeout(function () {
+    liveRefreshConnectors();
+  }, 80);
+}
+
+function attachPageListener(page) {
+  if (attachedPages[page.id]) return;
+  attachedPages[page.id] = true;
+  page.on("nodechange", function (event) {
+    handleNodeChanges(event.nodeChanges);
+  });
+}
+
+// Defer so the plugin window opens immediately
+setTimeout(function () {
+  attachPageListener(figma.currentPage);
+  rebuildHeapIndex();
+}, 0);
+
+figma.on("currentpagechange", function () {
+  attachPageListener(figma.currentPage);
+  rebuildHeapIndex();
+});
+
+// ─── Anchor dot ↔ element binding ────────────────────────────────────
+async function getAnchorBox(dot) {
+  var nid = "";
+  try { nid = dot.getPluginData("anchorNodeId"); } catch (e) {}
+  if (!nid) return null;
+  var node = null;
+  try { node = await figma.getNodeByIdAsync(nid); } catch (e) { return null; }
+  if (!node || node.removed || !("absoluteBoundingBox" in node) || !node.absoluteBoundingBox) return null;
+  return node.absoluteBoundingBox;
+}
+
+// User dragged the dot: store its new offset relative to the element
+async function updateDotOffset(dot) {
+  var box = await getAnchorBox(dot);
+  if (!box) return;
+  dot.setPluginData("anchorOffsetX", String(dot.x + dot.width / 2 - box.x));
+  dot.setPluginData("anchorOffsetY", String(dot.y + dot.height / 2 - box.y));
+}
+
+// Element moved: pull the dot along using the stored offset
+async function repositionDot(dot) {
+  var box = await getAnchorBox(dot);
+  if (!box) return false;
+  var ox = parseFloat(dot.getPluginData("anchorOffsetX"));
+  var oy = parseFloat(dot.getPluginData("anchorOffsetY"));
+  if (isNaN(ox)) ox = box.width / 2;
+  if (isNaN(oy)) oy = box.height / 2;
+  var nx = box.x + ox - dot.width / 2;
+  var ny = box.y + oy - dot.height / 2;
+  if (Math.abs(nx - dot.x) < 0.01 && Math.abs(ny - dot.y) < 0.01) return false;
+  dot.x = nx;
+  dot.y = ny;
+  return true;
+}
+
+// Redraws only the pairs that actually moved
+async function liveRefreshConnectors() {
+  isRefreshing = true;
+  var pairIds = pendingPairIds; pendingPairIds = {};
+  var dotIds = pendingDotIds; pendingDotIds = {};
+  var targetIds = pendingTargetIds; pendingTargetIds = {};
+
+  try {
+    var page = figma.currentPage;
+    var pairs = collectPairNodes(page);
+
+    // A dragged dot re-anchors: remember its new offset on the element
+    for (var dotId in dotIds) {
+      var dragged = pairs.dotsById[dotId];
+      if (dragged) await updateDotOffset(dragged);
+    }
+
+    // A moved element pulls its anchored dots along
+    var t2d = heapIndex ? heapIndex.targetToDots : {};
+    for (var tid in targetIds) {
+      var dotMap = t2d[tid] || {};
+      for (var dId in dotMap) {
+        var dot = pairs.dotsById[dId];
+        if (!dot) continue;
+        var moved = await repositionDot(dot);
+        if (moved) pairIds[dot.getPluginData("pairId")] = true;
       }
     }
 
-    if (!heapMoved) return;
+    for (var pid in pairIds) {
+      var conns = pairs.connsByPair[pid] || [];
+      for (var c = 0; c < conns.length; c++) conns[c].remove();
 
-    if (refreshTimeout) clearTimeout(refreshTimeout);
-    refreshTimeout = setTimeout(function () {
-      liveRefreshConnectors();
-    }, 80);
-  });
-});
+      var pairDot = pairs.dotsByPair[pid];
+      var ann = pairs.annByPair[pid];
+      if (!pairDot || !ann) continue;
 
-async function liveRefreshConnectors() {
-  isRefreshing = true;
-
-  var page = figma.currentPage;
-  var dots = page.findAll(function (n) { return n.name === "Heap anchor"; });
-  var connectors = page.findAll(function (n) { return n.name === "Heap connector"; });
-  var annotations = page.findAll(function (n) { return n.getPluginData("heapAnnotation") === "1" && n.type === "FRAME"; });
-
-  if (dots.length === 0 || annotations.length === 0) {
+      try {
+        await createCurvedLine(
+          pairDot.x + pairDot.width / 2, pairDot.y + pairDot.height / 2,
+          ann.x, ann.y, ann.width, ann.height, pid
+        );
+      } catch (e) {}
+    }
+  } catch (e) {
+  } finally {
     isRefreshing = false;
-    return;
   }
 
-  for (var i = 0; i < connectors.length; i++) {
-    connectors[i].remove();
-  }
-
-  var annByPair = {};
-  for (var a = 0; a < annotations.length; a++) {
-    var pid = annotations[a].getPluginData("pairId");
-    if (pid) annByPair[pid] = annotations[a];
-  }
-
-  for (var d = 0; d < dots.length; d++) {
-    var dot = dots[d];
-    var dotPairId = dot.getPluginData("pairId");
-    var paired = dotPairId ? annByPair[dotPairId] : null;
-
-    if (!paired) continue;
-
-    var dotCenterX = dot.x + dot.width / 2;
-    var dotCenterY = dot.y + dot.height / 2;
-
-    try {
-      await createCurvedLine(dotCenterX, dotCenterY, paired.x, paired.y, paired.width, paired.height);
-    } catch (e) {}
-  }
-
-  isRefreshing = false;
+  rebuildHeapIndex();
 }
 
 // ─── Message handler ─────────────────────────────────────────────────
@@ -105,7 +264,7 @@ figma.ui.onmessage = async (msg) => {
       break;
 
     case "get-filekey":
-      // Try every possible way to get the file key
+      // Always prefer the file currently open; saved key only as last resort
       var detectedKey = "";
       try { detectedKey = figma.fileKey || ""; } catch (e) {}
       if (!detectedKey) {
@@ -115,35 +274,73 @@ figma.ui.onmessage = async (msg) => {
       break;
 
     case "convert":
-      await convertComments(msg.comments, msg.options);
+      await convertComments(msg.comments);
       break;
 
     case "refresh-connectors":
-      refreshConnectors();
+      await refreshConnectors();
       break;
 
     case "get-viewport":
-      var vb = figma.viewport.bounds;
+      var vpb = figma.viewport.bounds;
       figma.ui.postMessage({
         type: "viewport-bounds",
-        bounds: { x: vb.x, y: vb.y, width: vb.width, height: vb.height },
+        bounds: { x: vpb.x, y: vpb.y, width: vpb.width, height: vpb.height },
       });
       break;
 
     case "check-page-nodes":
-      // Build node ID set and bbox map for the current page
-      var allPageNodes = figma.currentPage.findAll();
+      var vb = msg.viewportBounds || null;
       var nodeIdSet = {};
       var nodeBBoxMap = {};
       nodeIdSet[figma.currentPage.id] = true;
-      for (var ni = 0; ni < allPageNodes.length; ni++) {
-        var pn = allPageNodes[ni];
-        nodeIdSet[pn.id] = true;
-        if (pn.absoluteBoundingBox) nodeBBoxMap[pn.id] = pn.absoluteBoundingBox;
+
+      // Build the node ID set + bbox map. The filter below is the original,
+      // proven logic (pin = bbox + node_offset, tested against the viewport).
+      // The only optimization: when we have a viewport, we walk the page tree
+      // and PRUNE any subtree whose box is off screen, so we touch only what's
+      // visible instead of every node on the canvas (orders of magnitude less).
+      if (vb) {
+        var vbR = vb.x + vb.width, vbB = vb.y + vb.height;
+        var stack = figma.currentPage.children.slice();
+        while (stack.length) {
+          var n = stack.pop();
+          var nbox = ("absoluteBoundingBox" in n) ? n.absoluteBoundingBox : null;
+          // Off-screen node → its children are inside it, so skip the subtree
+          if (nbox && (nbox.x > vbR || nbox.x + nbox.width < vb.x ||
+                       nbox.y > vbB || nbox.y + nbox.height < vb.y)) {
+            continue;
+          }
+          nodeIdSet[n.id] = true;
+          if (nbox) nodeBBoxMap[n.id] = nbox;
+          if ("children" in n) {
+            var kids = n.children;
+            for (var ki = 0; ki < kids.length; ki++) stack.push(kids[ki]);
+          }
+        }
+      } else {
+        // Full-page scan (fallback button): no viewport to prune by
+        var allPageNodes = figma.currentPage.findAll();
+        for (var ni = 0; ni < allPageNodes.length; ni++) {
+          var pn = allPageNodes[ni];
+          nodeIdSet[pn.id] = true;
+          if (pn.absoluteBoundingBox) nodeBBoxMap[pn.id] = pn.absoluteBoundingBox;
+        }
       }
 
-      var vb = msg.viewportBounds || null;
+      // Comments already converted on this page (cards store the commentId).
+      // Annotations are top-level, so this top-level scan is cheap + complete.
+      var convertedIds = [];
+      try {
+        var pairsScan = collectPairNodes(figma.currentPage);
+        for (var pk in pairsScan.annByPair) {
+          var cidv = pairsScan.annByPair[pk].getPluginData("commentId");
+          if (cidv) convertedIds.push(cidv);
+        }
+      } catch (e) {}
+
       var validIds = [];
+      var stats = { total: msg.items.length, otherPage: 0, outsideViewport: 0, inView: 0 };
 
       for (var pi = 0; pi < msg.items.length; pi++) {
         var item = msg.items[pi];
@@ -152,8 +349,12 @@ figma.ui.onmessage = async (msg) => {
         var effectiveId = rawId && nodeIdSet[rawId] ? rawId : normalizedId;
 
         // ── Page filter ──────────────────────────────────────────────
+        // With a viewport we only mapped visible nodes, so a miss means the
+        // anchor is either off-screen or on another page → "not in view".
+        // Without a viewport (page scan) the map is complete → another page.
         if (rawId && !nodeIdSet[rawId] && !nodeIdSet[normalizedId]) {
-          continue; // comment is on a different page
+          if (vb) stats.outsideViewport++; else stats.otherPage++;
+          continue;
         }
 
         // ── Viewport filter ──────────────────────────────────────────
@@ -171,13 +372,17 @@ figma.ui.onmessage = async (msg) => {
           }
           if (px !== undefined && (px < vb.x || px > vb.x + vb.width ||
                                    py < vb.y || py > vb.y + vb.height)) {
+            stats.outsideViewport++;
             continue; // outside viewport
           }
         }
 
         validIds.push(item.commentId);
+        stats.inView++;
       }
-      figma.ui.postMessage({ type: "page-nodes-result", validIds: validIds });
+
+      console.log("[Heap] scan:", JSON.stringify(stats), "vb:", JSON.stringify(vb));
+      figma.ui.postMessage({ type: "page-nodes-result", validIds: validIds, convertedIds: convertedIds, stats: stats });
       break;
 
     case "cancel":
@@ -206,6 +411,19 @@ function formatDateSpanish() {
   return months[d.getMonth()] + " " + d.getDate() + ", " + d.getFullYear();
 }
 
+function rectsOverlap(a, b) {
+  var m = 8; // breathing room between cards
+  return a.x < b.x + b.w + m && a.x + a.w + m > b.x &&
+         a.y < b.y + b.h + m && a.y + a.h + m > b.y;
+}
+
+function overlapsAny(rect, rects) {
+  for (var i = 0; i < rects.length; i++) {
+    if (rectsOverlap(rect, rects[i])) return true;
+  }
+  return false;
+}
+
 // ─── Colors ──────────────────────────────────────────────────────────
 const COLORS = {
   accent: "#31d891",
@@ -217,26 +435,26 @@ const COLORS = {
 };
 
 // ─── Resolve comment position ────────────────────────────────────────
-function resolveCommentPosition(c) {
+async function resolveCommentPosition(c) {
   var meta = c.clientMeta || {};
 
-  // Method 1: Node-pinned comment — search only current page (always loaded)
+  // Method 1: Node-pinned comment — direct id lookup (no tree traversal).
+  // findOne() walks the entire page per comment (tens of thousands of nodes
+  // on heavy files → minutes); getNodeByIdAsync is a direct hash lookup.
+  // REST node_id may use "-" separators, Figma uses ":", so try both forms.
   if (meta.node_id) {
-    try {
-      var rawId = meta.node_id;
-      var normalizedId = rawId.replace(/-/g, ":");
-      var node = figma.currentPage.findOne(function(n) {
-        return n.id === rawId || n.id === normalizedId;
-      });
-      if (node && "absoluteBoundingBox" in node) {
-        var box = node.absoluteBoundingBox;
-        if (box) {
+    var ids = [meta.node_id, meta.node_id.replace(/-/g, ":")];
+    for (var i = 0; i < ids.length; i++) {
+      try {
+        var node = await figma.getNodeByIdAsync(ids[i]);
+        if (node && !node.removed && "absoluteBoundingBox" in node && node.absoluteBoundingBox) {
+          var box = node.absoluteBoundingBox;
           var offsetX = meta.node_offset ? meta.node_offset.x : box.width / 2;
           var offsetY = meta.node_offset ? meta.node_offset.y : box.height / 2;
           return { x: box.x + offsetX, y: box.y + offsetY, anchorNode: node };
         }
-      }
-    } catch (e) {}
+      } catch (e) {}
+    }
   }
 
   // Method 2: Floating comment — absolute canvas coordinates from REST API
@@ -250,74 +468,113 @@ function resolveCommentPosition(c) {
 }
 
 // ─── Main conversion logic ───────────────────────────────────────────
-async function convertComments(comments, options) {
+async function convertComments(comments) {
   try {
     await figma.loadFontAsync({ family: "Inter", style: "Regular" });
     await figma.loadFontAsync({ family: "Inter", style: "Semi Bold" });
     await figma.loadFontAsync({ family: "Inter", style: "Bold" });
   } catch (e) {
-    figma.notify("Error loading Inter font.", { error: true });
-    figma.ui.postMessage({ type: "convert-done", count: 0, error: "Font loading failed" });
+    figma.notify("Error al cargar la fuente Inter.", { error: true });
+    figma.ui.postMessage({ type: "convert-done", count: 0, successIds: [], error: "Font loading failed" });
     return;
   }
 
+  isRefreshing = true;
   var count = 0;
   var createdNodes = [];
+  var successIds = [];
 
-  for (var i = 0; i < comments.length; i++) {
-    var c = comments[i];
-    try {
-      var pos = resolveCommentPosition(c);
-
-      // Position annotation to the right of the anchor
-      var frameX = pos.x + 120;
-      var frameY = pos.y - 20;
-
-      // Create annotation card and wrap it in a group
-      var annotationFrame = createAnnotationFrame(c.eventName, c.user || "", frameX, frameY);
-      var group = figma.group([annotationFrame], figma.currentPage);
-      group.name = c.eventName;
-
-      var pairId = "heap-pair-" + Date.now() + "-" + i;
-      annotationFrame.setPluginData("pairId", pairId);
-
-      // Anchor dot at the comment position
-      var dot = figma.createEllipse();
-      dot.name = "Heap anchor";
-      dot.resize(8, 8);
-      dot.x = pos.x - 4;
-      dot.y = pos.y - 4;
-      dot.fills = [{ type: "SOLID", color: hexToRgb(COLORS.accent) }];
-      dot.strokes = [{ type: "SOLID", color: hexToRgb(COLORS.white) }];
-      dot.strokeWeight = 1.5;
-      dot.setPluginData("pairId", pairId);
-
-      // Dashed connector line
-      try {
-        var line = await createCurvedLine(pos.x, pos.y, frameX, frameY, annotationFrame.width, annotationFrame.height);
-        createdNodes.push(line);
-      } catch (lineErr) {
-        console.error("Line creation failed:", lineErr);
-      }
-
-      if (options.lockFrames) {
-        group.locked = true;
-      }
-
-      createdNodes.push(dot);
-      createdNodes.push(group);
-      count++;
-    } catch (err) {
-      console.error("Error creating annotation for:", c.eventName, err);
+  // Existing cards on the page, so new ones don't land on top of them
+  var placedRects = [];
+  try {
+    var existingPairs = collectPairNodes(figma.currentPage);
+    for (var pk in existingPairs.annByPair) {
+      var bb = existingPairs.annByPair[pk].absoluteBoundingBox;
+      if (bb) placedRects.push({ x: bb.x, y: bb.y, w: bb.width, h: bb.height });
     }
+  } catch (e) {}
+
+  try {
+    for (var i = 0; i < comments.length; i++) {
+      var c = comments[i];
+      try {
+        var pos = await resolveCommentPosition(c);
+
+        // Position annotation to the right of the anchor
+        var frameX = pos.x + 120;
+        var frameY = pos.y - 20;
+
+        var annotationFrame = createAnnotationFrame(c.eventName, c.user || "", frameX, frameY);
+
+        // Stagger downward until the card stops overlapping other cards
+        var rect = { x: annotationFrame.x, y: annotationFrame.y, w: annotationFrame.width, h: annotationFrame.height };
+        var guard = 0;
+        while (guard < 50 && overlapsAny(rect, placedRects)) {
+          rect.y += rect.h + 16;
+          guard++;
+        }
+        annotationFrame.y = rect.y;
+        placedRects.push(rect);
+
+        var pairId = "heap-pair-" + Date.now() + "-" + i;
+        annotationFrame.setPluginData("pairId", pairId);
+        annotationFrame.setPluginData("commentId", c.id || "");
+
+        var group = figma.group([annotationFrame], figma.currentPage);
+        group.name = c.eventName;
+        group.setPluginData("pairId", pairId);
+
+        // Anchor dot at the comment position
+        var dot = figma.createEllipse();
+        dot.name = "Heap anchor";
+        dot.resize(8, 8);
+        dot.x = pos.x - 4;
+        dot.y = pos.y - 4;
+        dot.fills = [{ type: "SOLID", color: hexToRgb(COLORS.accent) }];
+        dot.strokes = [{ type: "SOLID", color: hexToRgb(COLORS.white) }];
+        dot.strokeWeight = 1.5;
+        dot.setPluginData("pairId", pairId);
+
+        // Bind the dot to the commented element so it follows it
+        if (pos.anchorNode && pos.anchorNode.absoluteBoundingBox) {
+          var abox = pos.anchorNode.absoluteBoundingBox;
+          dot.setPluginData("anchorNodeId", pos.anchorNode.id);
+          dot.setPluginData("anchorOffsetX", String(pos.x - abox.x));
+          dot.setPluginData("anchorOffsetY", String(pos.y - abox.y));
+        }
+
+        // Dashed connector line
+        try {
+          var line = await createCurvedLine(pos.x, pos.y, annotationFrame.x, annotationFrame.y, annotationFrame.width, annotationFrame.height, pairId);
+          createdNodes.push(line);
+        } catch (lineErr) {
+          console.error("Line creation failed:", lineErr);
+        }
+
+        createdNodes.push(dot);
+        createdNodes.push(group);
+        successIds.push(c.id);
+        count++;
+      } catch (err) {
+        console.error("Error creating annotation for:", c.eventName, err);
+      }
+    }
+  } finally {
+    isRefreshing = false;
   }
+
+  rebuildHeapIndex();
 
   if (createdNodes.length > 0) {
     figma.viewport.scrollAndZoomIntoView(createdNodes);
   }
 
-  figma.ui.postMessage({ type: "convert-done", count: count });
-  figma.notify("Done! " + count + " Heap annotations created");
+  figma.ui.postMessage({ type: "convert-done", count: count, successIds: successIds });
+  if (count > 0) {
+    figma.notify("Listo: " + count + " anotaciones Heap creadas");
+  } else {
+    figma.notify("No se pudo crear ninguna anotación", { error: true });
+  }
 }
 
 // ─── Annotation frame builder ────────────────────────────────────────
@@ -400,7 +657,7 @@ function createAnnotationFrame(eventName, user, x, y) {
 }
 
 // ─── Smart dashed line: connects to closest side of card ─────────────
-async function createCurvedLine(dotX, dotY, cardX, cardY, cardW, cardH) {
+async function createCurvedLine(dotX, dotY, cardX, cardY, cardW, cardH, pairId) {
   // Calculate distances from dot to each edge center
   var leftX = cardX, leftY = cardY + cardH / 2;
   var rightX = cardX + cardW, rightY = cardY + cardH / 2;
@@ -434,6 +691,7 @@ async function createCurvedLine(dotX, dotY, cardX, cardY, cardW, cardH) {
   vector.x = dotX;
   vector.y = dotY;
   vector.fills = [];
+  if (pairId) vector.setPluginData("pairId", pairId);
 
   // L-shaped path: bend direction depends on connection side
   var vertices, segments;
@@ -479,50 +737,53 @@ async function createCurvedLine(dotX, dotY, cardX, cardY, cardW, cardH) {
 
 // ─── Refresh all connectors based on paired positions ────────────────
 async function refreshConnectors() {
-  var page = figma.currentPage;
-
-  var dots = page.findAll(function (n) { return n.name === "Heap anchor"; });
-  var connectors = page.findAll(function (n) { return n.name === "Heap connector"; });
-  var annotations = page.findAll(function (n) { return n.getPluginData("heapAnnotation") === "1" && n.type === "FRAME"; });
-
-  if (dots.length === 0 || annotations.length === 0) {
-    figma.notify("No Heap annotations found on this page.");
-    figma.ui.postMessage({ type: "refresh-done", count: 0 });
-    return;
-  }
-
-  // Delete old connectors
-  for (var i = 0; i < connectors.length; i++) {
-    connectors[i].remove();
-  }
-
-  // Build lookup: pairId → annotation
-  var annByPair = {};
-  for (var a = 0; a < annotations.length; a++) {
-    var pid = annotations[a].getPluginData("pairId");
-    if (pid) annByPair[pid] = annotations[a];
-  }
-
-  // Redraw using pair IDs
+  isRefreshing = true;
   var count = 0;
-  for (var d = 0; d < dots.length; d++) {
-    var dot = dots[d];
-    var dotPairId = dot.getPluginData("pairId");
-    var paired = dotPairId ? annByPair[dotPairId] : null;
 
-    if (!paired) continue;
+  try {
+    var page = figma.currentPage;
+    var pairs = collectPairNodes(page);
 
-    var dotCenterX = dot.x + dot.width / 2;
-    var dotCenterY = dot.y + dot.height / 2;
-
-    try {
-      await createCurvedLine(dotCenterX, dotCenterY, paired.x, paired.y, paired.width, paired.height);
-      count++;
-    } catch (e) {
-      console.error("Refresh line failed:", e);
+    if (pairs.dots.length === 0 || Object.keys(pairs.annByPair).length === 0) {
+      figma.notify("No hay anotaciones Heap en esta página.");
+      figma.ui.postMessage({ type: "refresh-done", count: 0 });
+      return;
     }
+
+    // Delete every connector, including untagged ones from older versions
+    for (var pk in pairs.connsByPair) {
+      var pcs = pairs.connsByPair[pk];
+      for (var pc = 0; pc < pcs.length; pc++) pcs[pc].remove();
+    }
+    for (var lc = 0; lc < pairs.legacyConnectors.length; lc++) {
+      pairs.legacyConnectors[lc].remove();
+    }
+
+    // Redraw using pair IDs, snapping anchored dots back onto their element
+    for (var d = 0; d < pairs.dots.length; d++) {
+      var dot = pairs.dots[d];
+      try { await repositionDot(dot); } catch (e) {}
+
+      var dotPairId = dot.getPluginData("pairId");
+      var paired = dotPairId ? pairs.annByPair[dotPairId] : null;
+      if (!paired) continue;
+
+      try {
+        await createCurvedLine(
+          dot.x + dot.width / 2, dot.y + dot.height / 2,
+          paired.x, paired.y, paired.width, paired.height, dotPairId
+        );
+        count++;
+      } catch (e) {
+        console.error("Refresh line failed:", e);
+      }
+    }
+
+    figma.notify("Se actualizaron " + count + " conectores");
+    figma.ui.postMessage({ type: "refresh-done", count: count });
+  } finally {
+    isRefreshing = false;
   }
 
-  figma.notify("Refreshed " + count + " connectors");
-  figma.ui.postMessage({ type: "refresh-done", count: count });
+  rebuildHeapIndex();
 }
