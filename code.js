@@ -504,7 +504,7 @@ async function convertComments(comments) {
         var frameX = pos.x + 120;
         var frameY = pos.y - 20;
 
-        var annotationFrame = createAnnotationFrame(c.eventName, c.user || "", frameX, frameY);
+        var annotationFrame = createAnnotationFrame(c.eventName, c.user || "", frameX, frameY, c.commentType, c.rawMessage);
 
         // Stagger downward until the card stops overlapping other cards
         var rect = { x: annotationFrame.x, y: annotationFrame.y, w: annotationFrame.width, h: annotationFrame.height };
@@ -578,8 +578,25 @@ async function convertComments(comments) {
 }
 
 // ─── Annotation frame builder ────────────────────────────────────────
-function createAnnotationFrame(eventName, user, x, y) {
+function parseJsonProperties(raw) {
+  var props = {};
+  var startIdx = raw.indexOf('"properties"');
+  var searchStr = startIdx >= 0 ? raw.substring(startIdx) : raw;
+  // Match "Key": "Value" (standard) and Key: "Value" (unquoted notes like Mensaje:)
+  var re = /(?:"([^"]+)"|([A-Za-z]\w*))\s*:\s*"([^"]*)"/g;
+  var m;
+  while ((m = re.exec(searchStr)) !== null) {
+    var key = m[1] || m[2];
+    if (key === 'properties') continue;
+    props[key] = m[3];
+  }
+  return props;
+}
+
+function createAnnotationFrame(eventName, user, x, y, commentType, rawMessage) {
   var date = formatDateSpanish();
+  var isJson = commentType === 'json';
+  var jsonProps = isJson ? parseJsonProperties(rawMessage || '') : null;
 
   var outer = figma.createFrame();
   outer.name = eventName;
@@ -623,7 +640,7 @@ function createAnnotationFrame(eventName, user, x, y) {
   inner.topRightRadius = 6;
   inner.bottomRightRadius = 6;
   inner.bottomLeftRadius = 0;
-  inner.resize(256, inner.height);
+  inner.resize(isJson ? 320 : 256, inner.height);
 
   var logo = figma.createNodeFromSvg(HEAP_SVG);
   logo.name = "Heap logo";
@@ -649,6 +666,23 @@ function createAnnotationFrame(eventName, user, x, y) {
 
   inner.appendChild(logo);
   inner.appendChild(nameText);
+
+  if (isJson && jsonProps) {
+    var propsLines = [];
+    for (var key in jsonProps) propsLines.push(key + ': ' + jsonProps[key]);
+    if (propsLines.length > 0) {
+      var propsText = figma.createText();
+      propsText.characters = propsLines.join('\n');
+      propsText.fontSize = 10;
+      propsText.fontName = { family: "Inter", style: "Regular" };
+      propsText.fills = [{ type: "SOLID", color: hexToRgb(COLORS.textSecondary) }];
+      propsText.lineHeight = { value: 14, unit: "PIXELS" };
+      propsText.layoutAlign = "STRETCH";
+      propsText.textAutoResize = "HEIGHT";
+      inner.appendChild(propsText);
+    }
+  }
+
   inner.appendChild(dateText);
   outer.appendChild(inner);
   outer.setPluginData("heapAnnotation", "1");
