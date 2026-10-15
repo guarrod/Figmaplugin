@@ -11,7 +11,7 @@
   "enablePrivatePluginApi": true,
   "networkAccess": {
     "allowedDomains": [
-      "https://api.figma.com"
+      "https://guarrod.com"
     ]
   }
 }

@@ -236,24 +236,6 @@
 </head>
 <body>
 
-<!-- ═══ Token Section ═══ -->
-<div class="token-section" id="tokenSection" style="display:none">
-  <div class="token-header" onclick="toggleTokenSection()">
-    <span>Token API de Figma</span>
-    <span class="status" id="tokenStatus"></span>
-  </div>
-  <div class="token-body">
-    <p>Configuración inicial. Obtén tu token en<br>
-    <strong>Figma → Settings → Personal access tokens</strong><br>
-    Permisos requeridos: <code style="font-size:10px">file_comments:read</code>, <code style="font-size:10px">file_comments:write</code>, <code style="font-size:10px">file_content:read</code></p>
-    <div class="token-row">
-      <input type="password" class="token-input" id="tokenInput"
-             placeholder="figd_XXXXXXXXXXXX" />
-      <button class="btn btn-primary" onclick="saveToken()">Guardar</button>
-    </div>
-  </div>
-</div>
-
 <!-- ═══ Scan Scope ═══ -->
 <div style="margin-bottom:8px; padding:8px 10px; background:var(--figma-color-bg-secondary, #f5f5f5); border-radius:6px;">
   <div style="display:flex; align-items:center; justify-content:space-between;">
@@ -352,9 +334,12 @@
 
 <script>
 // ─── State ───────────────────────────────────────────────────────────
+// Backend que guarda la autorización OAuth de Figma (ver server/README.md)
+var API_BASE = "https://guarrod.com/heap-api";
+var API_KEY = "f04b9ab7498e29b838a1159831e6560ebf58ed194e81c242";
+
 var state = {
   fileKey: "",
-  token: "",
   comments: [],
   userNames: [],
   activeUser: "all",
@@ -369,13 +354,6 @@ window.onmessage = function (event) {
 
   if (msg.type === "init") {
     state.fileKey = msg.fileKey;
-    state.token = msg.token;
-    document.getElementById("tokenInput").value = msg.token;
-    updateTokenStatus();
-  }
-
-  if (msg.type === "token-saved") {
-    updateTokenStatus();
   }
 
   if (msg.type === "filekey-saved") { /* state.fileKey already set before triggering save */ }
@@ -464,40 +442,6 @@ function saveFileKeyAndScan() {
   postToPlugin({ type: "get-viewport" });
 }
 
-function showTokenSetup() {
-  var section = document.getElementById("tokenSection");
-  section.style.display = "";
-  section.classList.remove("collapsed");
-}
-
-// ─── Token management ────────────────────────────────────────────────
-function toggleTokenSection() {
-  document.getElementById("tokenSection").classList.toggle("collapsed");
-}
-
-function saveToken() {
-  var token = document.getElementById("tokenInput").value.trim();
-  if (!token) return;
-  state.token = token;
-  postToPlugin({ type: "save-token", token: token });
-  updateTokenStatus();
-}
-
-function updateTokenStatus() {
-  var el = document.getElementById("tokenStatus");
-  var section = document.getElementById("tokenSection");
-  if (state.token) {
-    el.className = "status status-ok";
-    el.textContent = "Conectado";
-    section.classList.add("collapsed");
-    section.style.display = "none"; // Hide entirely when connected
-  } else {
-    el.className = "status status-missing";
-    el.textContent = "Requerido";
-    section.classList.remove("collapsed");
-    section.style.display = "";
-  }
-}
 
 // ─── Scan comments from Figma REST API ───────────────────────────────
 function scanComments() {
@@ -505,11 +449,6 @@ function scanComments() {
 }
 
 function startScan() {
-  if (!state.token) {
-    showError("Primero configura tu token API de Figma.");
-    return;
-  }
-
   hideError();
   document.getElementById("results").style.display = "none";
   document.getElementById("emptyState").style.display = "none";
@@ -526,18 +465,22 @@ function startScan() {
 async function doScan() {
   try {
     var response = await fetch(
-      "https://api.figma.com/v1/files/" + state.fileKey + "/comments",
-      { headers: { "X-Figma-Token": state.token } }
+      API_BASE + "/files/" + state.fileKey + "/comments",
+      { headers: { "X-Heap-Key": API_KEY } }
     );
 
     if (!response.ok) {
+      if (response.status === 401) {
+        throw new Error("La clave del plugin no es válida. Actualiza el plugin a la última versión.");
+      }
+      if (response.status === 503) {
+        throw new Error("El servicio de Figma no está autorizado o su autorización venció. Avisa al administrador del plugin.");
+      }
       if (response.status === 403) {
-        state.token = "";
-        updateTokenStatus(); // Show token section again
-        throw new Error("Token inválido o expirado. Actualiza tu token de API.");
+        throw new Error("La cuenta conectada no tiene acceso a este archivo.");
       }
       if (response.status === 404) {
-        throw new Error("Archivo no encontrado. Verifica que tu token tenga acceso a este archivo.");
+        throw new Error("Archivo no encontrado. Verifica que la cuenta conectada tenga acceso a este archivo.");
       }
       throw new Error("Error de API: " + response.status);
     }
@@ -777,10 +720,11 @@ async function deleteConvertedComments(ids) {
   for (var j = 0; j < ids.length; j++) {
     try {
       var res = await fetch(
-        "https://api.figma.com/v1/files/" + state.fileKey + "/comments/" + ids[j],
-        { method: "DELETE", headers: { "X-Figma-Token": state.token } }
+        API_BASE + "/files/" + state.fileKey + "/comments/" + ids[j],
+        { method: "DELETE", headers: { "X-Heap-Key": API_KEY } }
       );
-      if (!res.ok) failed++;
+      var del = res.ok ? await res.json() : null;
+      if (!del || !del.deleted) failed++;
     } catch (e) {
       console.error("Failed to delete comment:", ids[j], e);
       failed++;
@@ -835,16 +779,13 @@ function escapeHtml(str) {
   return str.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
 }
 
-// Enter submits in both setup inputs
-document.getElementById("tokenInput").addEventListener("keydown", function (e) {
-  if (e.key === "Enter") saveToken();
-});
+// Enter submits the file key input
 document.getElementById("inlineFileKeyInput").addEventListener("keydown", function (e) {
   if (e.key === "Enter") saveFileKeyAndScan();
 });
 </script>
 <div style="text-align:center; padding:8px 0 4px; font-size:10px; color:var(--figma-color-text-tertiary, #bbb);">
-  v0.72 · <button class="btn-text" style="font-size:10px;color:var(--figma-color-text-tertiary,#bbb)" onclick="showTokenSetup()">Cambiar token</button>
+  v0.73
 </div>
 </body>
 </html>

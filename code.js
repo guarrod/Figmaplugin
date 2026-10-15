@@ -20,7 +20,6 @@ figma.skipInvisibleInstanceChildren = true;
 
 // ─── Init ────────────────────────────────────────────────────────────
 (async () => {
-  const token = (await figma.clientStorage.getAsync("heap-token")) || "";
   // Always use the file currently open on screen. Only fall back to a saved
   // key if the editor can't report the current one (manual entry as a last
   // resort) — so the plugin scans wherever the user is, never a stale file.
@@ -30,7 +29,6 @@ figma.skipInvisibleInstanceChildren = true;
   figma.ui.postMessage({
     type: "init",
     fileKey: fileKey,
-    token: token,
   });
 })();
 
@@ -253,11 +251,6 @@ async function liveRefreshConnectors() {
 // ─── Message handler ─────────────────────────────────────────────────
 figma.ui.onmessage = async (msg) => {
   switch (msg.type) {
-    case "save-token":
-      await figma.clientStorage.setAsync("heap-token", msg.token);
-      figma.ui.postMessage({ type: "token-saved" });
-      break;
-
     case "save-filekey":
       figma.root.setPluginData("fileKey", msg.fileKey);
       figma.ui.postMessage({ type: "filekey-saved" });
