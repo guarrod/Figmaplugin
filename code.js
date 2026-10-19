@@ -571,25 +571,9 @@ async function convertComments(comments) {
 }
 
 // ─── Annotation frame builder ────────────────────────────────────────
-function parseJsonProperties(raw) {
-  var props = {};
-  var startIdx = raw.indexOf('"properties"');
-  var searchStr = startIdx >= 0 ? raw.substring(startIdx) : raw;
-  // Match "Key": "Value" (standard) and Key: "Value" (unquoted notes like Mensaje:)
-  var re = /(?:"([^"]+)"|([A-Za-z]\w*))\s*:\s*"([^"]*)"/g;
-  var m;
-  while ((m = re.exec(searchStr)) !== null) {
-    var key = m[1] || m[2];
-    if (key === 'properties') continue;
-    props[key] = m[3];
-  }
-  return props;
-}
-
 function createAnnotationFrame(eventName, user, x, y, commentType, rawMessage) {
   var date = formatDateSpanish();
   var isJson = commentType === 'json';
-  var jsonProps = isJson ? parseJsonProperties(rawMessage || '') : null;
 
   var outer = figma.createFrame();
   outer.name = eventName;
@@ -660,20 +644,17 @@ function createAnnotationFrame(eventName, user, x, y, commentType, rawMessage) {
   inner.appendChild(logo);
   inner.appendChild(nameText);
 
-  if (isJson && jsonProps) {
-    var propsLines = [];
-    for (var key in jsonProps) propsLines.push(key + ': ' + jsonProps[key]);
-    if (propsLines.length > 0) {
-      var propsText = figma.createText();
-      propsText.characters = propsLines.join('\n');
-      propsText.fontSize = 10;
-      propsText.fontName = { family: "Inter", style: "Regular" };
-      propsText.fills = [{ type: "SOLID", color: hexToRgb(COLORS.textSecondary) }];
-      propsText.lineHeight = { value: 14, unit: "PIXELS" };
-      propsText.layoutAlign = "STRETCH";
-      propsText.textAutoResize = "HEIGHT";
-      inner.appendChild(propsText);
-    }
+  // JSON comments: copy the comment verbatim (original line breaks and indentation)
+  if (isJson && rawMessage) {
+    var rawText = figma.createText();
+    rawText.characters = rawMessage;
+    rawText.fontSize = 10;
+    rawText.fontName = { family: "Inter", style: "Regular" };
+    rawText.fills = [{ type: "SOLID", color: hexToRgb(COLORS.textSecondary) }];
+    rawText.lineHeight = { value: 14, unit: "PIXELS" };
+    rawText.layoutAlign = "STRETCH";
+    rawText.textAutoResize = "HEIGHT";
+    inner.appendChild(rawText);
   }
 
   inner.appendChild(dateText);

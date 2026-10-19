@@ -509,6 +509,7 @@ async function doScan() {
         id: c.id,
         eventName: eventName,
         rawMessage: msg,
+        commentType: jsonMatch ? "json" : "other",
         user: c.user ? c.user.handle : "Desconocido",
         clientMeta: c.client_meta || {},
         createdAt: c.created_at,
@@ -696,6 +697,7 @@ function convert() {
       id: c.id,
       eventName: c.eventName,
       rawMessage: c.rawMessage,
+      commentType: c.commentType,
       user: c.user,
       clientMeta: c.clientMeta,
     });
