@@ -18,6 +18,18 @@ figma.showUI(__html__, { width: 380, height: 580, themeColors: true });
 // significant speedup for scanning large, component-heavy files.
 figma.skipInvisibleInstanceChildren = true;
 
+// ─── Connector line settings (persisted per file) ────────────────────
+var LINE_STYLES = ["orthogonal", "curve", "straight"];
+var LINE_ENDS = ["none", "arrow", "dot"];
+var lineStyle = "orthogonal";
+var lineEnd = "none";
+try {
+  var savedStyle = figma.root.getPluginData("heapLineStyle");
+  var savedEnd = figma.root.getPluginData("heapLineEnd");
+  if (LINE_STYLES.indexOf(savedStyle) !== -1) lineStyle = savedStyle;
+  if (LINE_ENDS.indexOf(savedEnd) !== -1) lineEnd = savedEnd;
+} catch (e) {}
+
 // ─── Init ────────────────────────────────────────────────────────────
 (async () => {
   // Always use the file currently open on screen. Only fall back to a saved
@@ -29,6 +41,8 @@ figma.skipInvisibleInstanceChildren = true;
   figma.ui.postMessage({
     type: "init",
     fileKey: fileKey,
+    lineStyle: lineStyle,
+    lineEnd: lineEnd,
   });
 })();
 
@@ -85,21 +99,45 @@ var attachedPages = {};
 // Index so the nodechange handler does pure id lookups (no API calls)
 var heapIndex = null; // { pairIdByNodeId, targetToDots }
 
+var indexBuild = 0;
+
 function rebuildHeapIndex() {
+  // Keep the previous anchor map until the new one resolves (no blind window)
+  var idx = { pairIdByNodeId: {}, targetToDots: heapIndex ? heapIndex.targetToDots : {} };
+  var dots = [];
   try {
     var pairs = collectPairNodes(figma.currentPage);
+    idx.pairIdByNodeId = pairs.pairIdByNodeId;
+    dots = pairs.dots;
+  } catch (e) {}
+  heapIndex = idx; // pair lookups are usable right away
+
+  // Moving a frame only reports the frame itself, not the elements inside it,
+  // so index every ancestor of each anchored element too (resolved async).
+  var token = ++indexBuild;
+  (async function () {
     var targetToDots = {};
-    for (var i = 0; i < pairs.dots.length; i++) {
-      var nid = "";
-      try { nid = pairs.dots[i].getPluginData("anchorNodeId"); } catch (e) {}
-      if (!nid) continue;
-      if (!targetToDots[nid]) targetToDots[nid] = {};
-      targetToDots[nid][pairs.dots[i].id] = true;
+    function add(id, dotId) {
+      if (!targetToDots[id]) targetToDots[id] = {};
+      targetToDots[id][dotId] = true;
     }
-    heapIndex = { pairIdByNodeId: pairs.pairIdByNodeId, targetToDots: targetToDots };
-  } catch (e) {
-    heapIndex = { pairIdByNodeId: {}, targetToDots: {} };
-  }
+    for (var i = 0; i < dots.length; i++) {
+      var nid = "", dotId = "";
+      try { nid = dots[i].getPluginData("anchorNodeId"); dotId = dots[i].id; } catch (e) {}
+      if (!nid) continue;
+      add(nid, dotId);
+      try {
+        var node = await figma.getNodeByIdAsync(nid);
+        var p = node && !node.removed ? node.parent : null;
+        var guard = 0;
+        while (p && p.type !== "PAGE" && p.type !== "DOCUMENT" && guard++ < 100) {
+          add(p.id, dotId);
+          p = p.parent;
+        }
+      } catch (e) {}
+    }
+    if (token === indexBuild) idx.targetToDots = targetToDots;
+  })();
 }
 
 function geoChanged(props) {
@@ -120,6 +158,8 @@ function handleNodeChanges(nodeChanges) {
     if (change.type !== "PROPERTY_CHANGE" || !change.node) continue;
     if (!geoChanged(change.properties)) continue;
     var node = change.node;
+    // Connectors are output only: our own redraws must not retrigger a refresh
+    try { if (node.name === "Heap connector") continue; } catch (e) { continue; }
 
     var pid = heapIndex.pairIdByNodeId[node.id];
     if (pid) {
@@ -227,17 +267,16 @@ async function liveRefreshConnectors() {
 
     for (var pid in pairIds) {
       var conns = pairs.connsByPair[pid] || [];
-      for (var c = 0; c < conns.length; c++) conns[c].remove();
-
       var pairDot = pairs.dotsByPair[pid];
       var ann = pairs.annByPair[pid];
-      if (!pairDot || !ann) continue;
+      if (!pairDot || !ann) {
+        for (var c = 0; c < conns.length; c++) conns[c].remove();
+        continue;
+      }
+      for (var ce = 1; ce < conns.length; ce++) conns[ce].remove();
 
       try {
-        await createCurvedLine(
-          pairDot.x + pairDot.width / 2, pairDot.y + pairDot.height / 2,
-          ann.x, ann.y, ann.width, ann.height, pid
-        );
+        await drawConnector(pairDot, ann, pid, conns[0] || null);
       } catch (e) {}
     }
   } catch (e) {
@@ -272,6 +311,20 @@ figma.ui.onmessage = async (msg) => {
 
     case "refresh-connectors":
       await refreshConnectors();
+      break;
+
+    case "sync-comments":
+      await syncCommentPositions(msg.items);
+      break;
+
+    case "set-line-style":
+      if (LINE_STYLES.indexOf(msg.lineStyle) !== -1) lineStyle = msg.lineStyle;
+      if (LINE_ENDS.indexOf(msg.lineEnd) !== -1) lineEnd = msg.lineEnd;
+      try {
+        figma.root.setPluginData("heapLineStyle", lineStyle);
+        figma.root.setPluginData("heapLineEnd", lineEnd);
+      } catch (e) {}
+      await refreshConnectors(true);
       break;
 
     case "get-viewport":
@@ -460,6 +513,75 @@ async function resolveCommentPosition(c) {
   return { x: vp.x, y: vp.y, anchorNode: null };
 }
 
+// ─── Follow the native comment pin ───────────────────────────────────
+// The plugin API can't see comments, so the UI polls them via the REST proxy
+// and sends their client_meta here. When a comment's pin moved since the last
+// sync, its anchor dot follows (a dot the user dragged by hand is left alone
+// until the comment itself moves again).
+function metaSig(m) {
+  m = m || {};
+  var o = m.node_offset;
+  return JSON.stringify([
+    m.node_id || "", o ? o.x : "", o ? o.y : "",
+    m.x === undefined ? "" : m.x, m.y === undefined ? "" : m.y,
+  ]);
+}
+
+async function syncCommentPositions(items) {
+  if (!items || !items.length || isRefreshing) return;
+
+  var pairs = collectPairNodes(figma.currentPage);
+  var pidByComment = {};
+  for (var pk in pairs.annByPair) {
+    var cid = pairs.annByPair[pk].getPluginData("commentId");
+    if (cid) pidByComment[cid] = pk;
+  }
+
+  var changed = [];
+  for (var i = 0; i < items.length; i++) {
+    var pid = pidByComment[items[i].commentId];
+    var dot = pid ? pairs.dotsByPair[pid] : null;
+    var meta = items[i].clientMeta || {};
+    if (!dot || (!meta.node_id && meta.x === undefined)) continue;
+
+    var sig = metaSig(meta);
+    var prev = dot.getPluginData("commentSig");
+    if (prev === sig) continue;
+    dot.setPluginData("commentSig", sig);
+    if (!prev) continue; // first sighting of an older annotation: just remember it
+
+    changed.push({ pid: pid, dot: dot, pos: await resolveCommentPosition({ clientMeta: meta }) });
+  }
+  if (changed.length === 0) return;
+
+  isRefreshing = true;
+  try {
+    for (var j = 0; j < changed.length; j++) {
+      var ch = changed[j], pos = ch.pos, d = ch.dot;
+      d.x = pos.x - d.width / 2;
+      d.y = pos.y - d.height / 2;
+      if (pos.anchorNode && pos.anchorNode.absoluteBoundingBox) {
+        var ab = pos.anchorNode.absoluteBoundingBox;
+        d.setPluginData("anchorNodeId", pos.anchorNode.id);
+        d.setPluginData("anchorOffsetX", String(pos.x - ab.x));
+        d.setPluginData("anchorOffsetY", String(pos.y - ab.y));
+      } else {
+        d.setPluginData("anchorNodeId", "");
+        d.setPluginData("anchorOffsetX", "");
+        d.setPluginData("anchorOffsetY", "");
+      }
+      var ann = pairs.annByPair[ch.pid];
+      if (!ann) continue;
+      var conns = pairs.connsByPair[ch.pid] || [];
+      for (var ce = 1; ce < conns.length; ce++) conns[ce].remove();
+      try { await drawConnector(d, ann, ch.pid, conns[0] || null); } catch (e) {}
+    }
+  } finally {
+    isRefreshing = false;
+  }
+  rebuildHeapIndex();
+}
+
 // ─── Main conversion logic ───────────────────────────────────────────
 async function convertComments(comments) {
   try {
@@ -527,6 +649,7 @@ async function convertComments(comments) {
         dot.strokes = [{ type: "SOLID", color: hexToRgb(COLORS.white) }];
         dot.strokeWeight = 1.5;
         dot.setPluginData("pairId", pairId);
+        dot.setPluginData("commentSig", metaSig(c.clientMeta));
 
         // Bind the dot to the commented element so it follows it
         if (pos.anchorNode && pos.anchorNode.absoluteBoundingBox) {
@@ -538,7 +661,7 @@ async function convertComments(comments) {
 
         // Dashed connector line
         try {
-          var line = await createCurvedLine(pos.x, pos.y, annotationFrame.x, annotationFrame.y, annotationFrame.width, annotationFrame.height, pairId);
+          var line = await drawConnector(dot, annotationFrame, pairId, null);
           createdNodes.push(line);
         } catch (lineErr) {
           console.error("Line creation failed:", lineErr);
@@ -664,87 +787,124 @@ function createAnnotationFrame(eventName, user, x, y, commentType, rawMessage) {
   return outer;
 }
 
-// ─── Smart dashed line: connects to closest side of card ─────────────
-async function createCurvedLine(dotX, dotY, cardX, cardY, cardW, cardH, pairId) {
-  // Calculate distances from dot to each edge center
-  var leftX = cardX, leftY = cardY + cardH / 2;
-  var rightX = cardX + cardW, rightY = cardY + cardH / 2;
-  var topX = cardX + cardW / 2, topY = cardY;
-  var bottomX = cardX + cardW / 2, bottomY = cardY + cardH;
+// ─── Connector line (Autoflow-style) ─────────────────────────────────
+// Picks the card side that faces the anchor dot, leaves the dot along that
+// axis and enters the card perpendicular to the side, so the line never
+// crosses the card. Three styles: orthogonal (rounded steps), curve (bezier)
+// and straight. Geometry uses absolute coordinates (works inside Sections).
+function pickSide(px, py, b) {
+  var L = b.x, R = b.x + b.width, T = b.y, B = b.y + b.height;
+  var gx = px < L ? L - px : (px > R ? px - R : 0);
+  var gy = py < T ? T - py : (py > B ? py - B : 0);
 
-  var distLeft = Math.sqrt(Math.pow(dotX - leftX, 2) + Math.pow(dotY - leftY, 2));
-  var distRight = Math.sqrt(Math.pow(dotX - rightX, 2) + Math.pow(dotY - rightY, 2));
-  var distTop = Math.sqrt(Math.pow(dotX - topX, 2) + Math.pow(dotY - topY, 2));
-  var distBottom = Math.sqrt(Math.pow(dotX - bottomX, 2) + Math.pow(dotY - bottomY, 2));
-
-  // Pick the closest edge
-  var minDist = Math.min(distLeft, distRight, distTop, distBottom);
-  var targetX, targetY, isVertical;
-
-  if (minDist === distLeft) {
-    targetX = leftX; targetY = leftY; isVertical = false;
-  } else if (minDist === distRight) {
-    targetX = rightX; targetY = rightY; isVertical = false;
-  } else if (minDist === distTop) {
-    targetX = topX; targetY = topY; isVertical = true;
-  } else {
-    targetX = bottomX; targetY = bottomY; isVertical = true;
+  if (gx === 0 && gy === 0) {
+    // Dot sits on the card: use the nearest edge
+    var d = { left: px - L, right: R - px, top: py - T, bottom: B - py };
+    var best = "left";
+    for (var k in d) if (d[k] < d[best]) best = k;
+    return best;
   }
+  if (gx >= gy) return px < L ? "left" : "right";
+  return py < T ? "top" : "bottom";
+}
 
-  var dx = targetX - dotX;
-  var dy = targetY - dotY;
+function sideAnchor(side, b) {
+  var cx = b.x + b.width / 2, cy = b.y + b.height / 2;
+  if (side === "left") return { x: b.x, y: cy, dx: 1, dy: 0 };
+  if (side === "right") return { x: b.x + b.width, y: cy, dx: -1, dy: 0 };
+  if (side === "top") return { x: cx, y: b.y, dx: 0, dy: 1 };
+  return { x: cx, y: b.y + b.height, dx: 0, dy: -1 };
+}
 
-  var vector = figma.createVector();
-  vector.name = "Heap connector";
-  vector.x = dotX;
-  vector.y = dotY;
-  vector.fills = [];
-  if (pairId) vector.setPluginData("pairId", pairId);
-
-  // L-shaped path: bend direction depends on connection side
+// Vertices/segments in coordinates relative to the dot (0,0)
+function buildLineNetwork(dx, dy, dir, style, end) {
+  var horiz = dir.dx !== 0;
   var vertices, segments;
 
-  if (isVertical) {
-    // Connecting top/bottom: go vertical first, then horizontal
-    var midY = dy * 0.5;
-    vertices = [
-      { x: 0, y: 0 },
-      { x: 0, y: midY, cornerRadius: 10 },
-      { x: dx, y: midY, cornerRadius: 10 },
-      { x: dx, y: dy },
-    ];
+  if (style === "straight") {
+    vertices = [{ x: 0, y: 0 }, { x: dx, y: dy }];
+    segments = [{ start: 0, end: 1 }];
+  } else if (style === "curve") {
+    var k = Math.min(220, Math.max(24, 0.5 * Math.abs(horiz ? dx : dy)));
+    vertices = [{ x: 0, y: 0 }, { x: dx, y: dy }];
+    segments = [{
+      start: 0, end: 1,
+      tangentStart: { x: dir.dx * k, y: dir.dy * k },
+      tangentEnd: { x: -dir.dx * k, y: -dir.dy * k },
+    }];
   } else {
-    // Connecting left/right: go horizontal first, then vertical
-    var midX = dx * 0.5;
-    vertices = [
-      { x: 0, y: 0 },
-      { x: midX, y: 0, cornerRadius: 10 },
-      { x: midX, y: dy, cornerRadius: 10 },
-      { x: dx, y: dy },
-    ];
+    var off = horiz ? dy : dx; // distance between the two parallel runs
+    if (Math.abs(off) < 0.5) {
+      vertices = [{ x: 0, y: 0 }, { x: dx, y: dy }];
+      segments = [{ start: 0, end: 1 }];
+    } else {
+      var r = Math.min(12, Math.abs(horiz ? dx : dy) / 2, Math.abs(off) / 2);
+      var c1, c2;
+      if (horiz) { c1 = { x: dx / 2, y: 0 }; c2 = { x: dx / 2, y: dy }; }
+      else { c1 = { x: 0, y: dy / 2 }; c2 = { x: dx, y: dy / 2 }; }
+      if (r >= 0.5) { c1.cornerRadius = r; c2.cornerRadius = r; }
+      vertices = [{ x: 0, y: 0 }, c1, c2, { x: dx, y: dy }];
+      segments = [{ start: 0, end: 1 }, { start: 1, end: 2 }, { start: 2, end: 3 }];
+    }
   }
 
-  segments = [
-    { start: 0, end: 1 },
-    { start: 1, end: 2 },
-    { start: 2, end: 3 },
-  ];
+  var cap = end === "arrow" ? "ARROW_LINES" : (end === "dot" ? "CIRCLE_FILLED" : null);
+  if (cap) vertices[vertices.length - 1].strokeCap = cap;
+  return { vertices: vertices, segments: segments, regions: [] };
+}
 
-  await vector.setVectorNetworkAsync({
-    vertices: vertices,
-    segments: segments,
-    regions: [],
-  });
+// Draws (or updates in place) the connector between an anchor dot and its card
+async function drawConnector(dot, card, pairId, existing) {
+  var db = dot.absoluteBoundingBox, cb = card.absoluteBoundingBox;
+  if (!db || !cb) throw new Error("No bounding box for connector");
+  var px = db.x + db.width / 2, py = db.y + db.height / 2;
 
-  vector.strokes = [{ type: "SOLID", color: hexToRgb(COLORS.accent) }];
-  vector.strokeWeight = 1.5;
-  vector.dashPattern = [5, 4];
+  var anchor = sideAnchor(pickSide(px, py, cb), cb);
+  var net = buildLineNetwork(anchor.x - px, anchor.y - py, anchor, lineStyle, lineEnd);
+
+  var vector = existing;
+  if (!vector) {
+    vector = figma.createVector();
+    vector.name = "Heap connector";
+    vector.fills = [];
+    vector.strokes = [{ type: "SOLID", color: hexToRgb(COLORS.accent) }];
+    vector.strokeWeight = 1.5;
+    vector.dashPattern = [5, 4];
+    if (pairId) vector.setPluginData("pairId", pairId);
+
+    // Sit just below the card (and above the design) so it never hides the card
+    var top = card;
+    while (top.parent && top.parent.type !== "PAGE") top = top.parent;
+    var page = figma.currentPage;
+    var idx = page.children.indexOf(top);
+    if (idx >= 0) page.insertChild(idx, vector);
+  }
+
+  vector.x = px;
+  vector.y = py;
+  try {
+    await vector.setVectorNetworkAsync(net);
+  } catch (e) {
+    // Retry without end caps in case the cap type is rejected
+    for (var i = 0; i < net.vertices.length; i++) delete net.vertices[i].strokeCap;
+    await vector.setVectorNetworkAsync(net);
+  }
+
+  // Figma may re-normalize the vector bounds: pin vertex 0 back onto the dot
+  var v0 = vector.vectorNetwork.vertices[0];
+  var t = vector.absoluteTransform;
+  var ex = px - (t[0][0] * v0.x + t[0][1] * v0.y + t[0][2]);
+  var ey = py - (t[1][0] * v0.x + t[1][1] * v0.y + t[1][2]);
+  if (Math.abs(ex) > 0.01 || Math.abs(ey) > 0.01) {
+    vector.x += ex;
+    vector.y += ey;
+  }
 
   return vector;
 }
 
 // ─── Refresh all connectors based on paired positions ────────────────
-async function refreshConnectors() {
+async function refreshConnectors(silent) {
   isRefreshing = true;
   var count = 0;
 
@@ -753,21 +913,19 @@ async function refreshConnectors() {
     var pairs = collectPairNodes(page);
 
     if (pairs.dots.length === 0 || Object.keys(pairs.annByPair).length === 0) {
-      figma.notify("No hay anotaciones Heap en esta página.");
+      if (!silent) figma.notify("No hay anotaciones Heap en esta página.");
       figma.ui.postMessage({ type: "refresh-done", count: 0 });
       return;
     }
 
-    // Delete every connector, including untagged ones from older versions
-    for (var pk in pairs.connsByPair) {
-      var pcs = pairs.connsByPair[pk];
-      for (var pc = 0; pc < pcs.length; pc++) pcs[pc].remove();
-    }
+    // Untagged connectors from older versions can't be paired: drop them
     for (var lc = 0; lc < pairs.legacyConnectors.length; lc++) {
       pairs.legacyConnectors[lc].remove();
     }
 
-    // Redraw using pair IDs, snapping anchored dots back onto their element
+    // Redraw using pair IDs, reusing each pair's connector and snapping
+    // anchored dots back onto their element
+    var drawn = {};
     for (var d = 0; d < pairs.dots.length; d++) {
       var dot = pairs.dots[d];
       try { await repositionDot(dot); } catch (e) {}
@@ -776,18 +934,26 @@ async function refreshConnectors() {
       var paired = dotPairId ? pairs.annByPair[dotPairId] : null;
       if (!paired) continue;
 
+      var conns = pairs.connsByPair[dotPairId] || [];
+      for (var ce = 1; ce < conns.length; ce++) conns[ce].remove();
+
       try {
-        await createCurvedLine(
-          dot.x + dot.width / 2, dot.y + dot.height / 2,
-          paired.x, paired.y, paired.width, paired.height, dotPairId
-        );
+        await drawConnector(dot, paired, dotPairId, conns[0] || null);
+        drawn[dotPairId] = true;
         count++;
       } catch (e) {
         console.error("Refresh line failed:", e);
       }
     }
 
-    figma.notify("Se actualizaron " + count + " conectores");
+    // Connectors whose dot or card no longer exists are orphans
+    for (var pk in pairs.connsByPair) {
+      if (drawn[pk] || (pairs.dotsByPair[pk] && pairs.annByPair[pk])) continue;
+      var orphans = pairs.connsByPair[pk];
+      for (var oc = 0; oc < orphans.length; oc++) orphans[oc].remove();
+    }
+
+    if (!silent) figma.notify("Se actualizaron " + count + " conectores");
     figma.ui.postMessage({ type: "refresh-done", count: count });
   } finally {
     isRefreshing = false;

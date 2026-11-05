@@ -254,6 +254,34 @@
   Actualizar líneas de conexión
 </button>
 
+<!-- ═══ Line style ═══ -->
+<div style="margin-bottom:12px; padding:8px 10px; background:var(--figma-color-bg-secondary, #f5f5f5); border-radius:6px;">
+  <div style="display:flex; align-items:center; gap:8px; margin-bottom:6px;">
+    <span style="font-size:11px; width:44px; color:var(--figma-color-text-secondary, #666);">Línea</span>
+    <div class="filter-row" id="lineStyleRow">
+      <button class="chip active" data-style="orthogonal" onclick="setLineStyle('orthogonal')">Ortogonal</button>
+      <button class="chip" data-style="curve" onclick="setLineStyle('curve')">Curva</button>
+      <button class="chip" data-style="straight" onclick="setLineStyle('straight')">Recta</button>
+    </div>
+  </div>
+  <div style="display:flex; align-items:center; gap:8px;">
+    <span style="font-size:11px; width:44px; color:var(--figma-color-text-secondary, #666);">Extremo</span>
+    <div class="filter-row" id="lineEndRow">
+      <button class="chip active" data-end="none" onclick="setLineEnd('none')">Ninguno</button>
+      <button class="chip" data-end="arrow" onclick="setLineEnd('arrow')">Flecha</button>
+      <button class="chip" data-end="dot" onclick="setLineEnd('dot')">Punto</button>
+    </div>
+  </div>
+</div>
+
+<!-- ═══ Follow comments ═══ -->
+<div style="margin-bottom:12px; padding:8px 10px; background:var(--figma-color-bg-secondary, #f5f5f5); border-radius:6px;">
+  <div style="display:flex; align-items:center; justify-content:space-between;">
+    <span style="font-size:11px; color:var(--figma-color-text-secondary, #666);">Seguir posición de los comentarios</span>
+    <div class="toggle on" id="optFollow" onclick="this.classList.toggle('on')"></div>
+  </div>
+</div>
+
 <!-- ═══ Error Display ═══ -->
 <div class="error-msg" id="errorMsg" style="display:none"></div>
 
@@ -345,6 +373,8 @@ var state = {
   activeUser: "all",
   deleting: false,
   viewportBounds: null,
+  lineStyle: "orthogonal",
+  lineEnd: "none",
 };
 
 // ─── Plugin communication ────────────────────────────────────────────
@@ -354,6 +384,9 @@ window.onmessage = function (event) {
 
   if (msg.type === "init") {
     state.fileKey = msg.fileKey;
+    state.lineStyle = msg.lineStyle || "orthogonal";
+    state.lineEnd = msg.lineEnd || "none";
+    renderLineSettings();
   }
 
   if (msg.type === "filekey-saved") { /* state.fileKey already set before triggering save */ }
@@ -421,6 +454,52 @@ window.onmessage = function (event) {
 function postToPlugin(msg) {
   parent.postMessage({ pluginMessage: msg }, "*");
 }
+
+// ─── Connector line settings ─────────────────────────────────────────
+function renderLineSettings() {
+  var rows = [["lineStyleRow", "data-style", state.lineStyle], ["lineEndRow", "data-end", state.lineEnd]];
+  for (var r = 0; r < rows.length; r++) {
+    var chips = document.getElementById(rows[r][0]).querySelectorAll(".chip");
+    for (var i = 0; i < chips.length; i++) {
+      chips[i].classList.toggle("active", chips[i].getAttribute(rows[r][1]) === rows[r][2]);
+    }
+  }
+}
+
+function sendLineSettings() {
+  renderLineSettings();
+  postToPlugin({ type: "set-line-style", lineStyle: state.lineStyle, lineEnd: state.lineEnd });
+}
+
+function setLineStyle(style) { state.lineStyle = style; sendLineSettings(); }
+function setLineEnd(end) { state.lineEnd = end; sendLineSettings(); }
+
+// ─── Follow comment pins (poll REST, plugin moves the dots) ──────────
+var FOLLOW_MS = 10000;
+var followBusy = false;
+
+async function followComments() {
+  if (followBusy || state.deleting || !state.fileKey) return;
+  if (!document.getElementById("optFollow").classList.contains("on")) return;
+  followBusy = true;
+  try {
+    var res = await fetch(API_BASE + "/files/" + state.fileKey + "/comments", { headers: { "X-Heap-Key": API_KEY } });
+    if (!res.ok) return;
+    var data = await res.json();
+    var items = [];
+    var all = data.comments || [];
+    for (var i = 0; i < all.length; i++) {
+      if (all[i].resolved_at || all[i].parent_id) continue;
+      items.push({ commentId: all[i].id, clientMeta: all[i].client_meta || {} });
+    }
+    if (items.length) postToPlugin({ type: "sync-comments", items: items });
+  } catch (e) {
+    // silent: next tick retries
+  } finally {
+    followBusy = false;
+  }
+}
+setInterval(followComments, FOLLOW_MS);
 
 // ─── Refresh connectors ──────────────────────────────────────────────
 function refreshConnectors() {
